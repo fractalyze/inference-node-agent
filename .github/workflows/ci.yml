@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      # prometheus-<version>.linux-amd64.tar.gz; matches the release's sha256sums.txt.
+      PROMETHEUS_VERSION: 3.12.0
+      PROMETHEUS_SHA256: 20da47f8e5303f74aecb78edd7f7e39041dac08ac4939dba75efd7a900ae8867
+      # alloy-linux-amd64.zip; matches the release's SHA256SUMS. The version
+      # is the one compose.yml runs.
+      ALLOY_VERSION: 1.21.2
+      ALLOY_SHA256: 1eadb46a0640127184250173acd9b4145e4d590680db37ffe66fa8afd07f04cf
+      # A missing alloy, prometheus or docker fails the tests instead of skipping them.
+      REQUIRE_TOOLS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+      - name: Install prometheus
+        run: |
+          tarball="prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz"
+          curl -fsSLo "$RUNNER_TEMP/$tarball" \
+            "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/$tarball"
+          echo "${PROMETHEUS_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP"
+          echo "PROMETHEUS=$RUNNER_TEMP/prometheus-${PROMETHEUS_VERSION}.linux-amd64/prometheus" >> "$GITHUB_ENV"
+      - name: Install alloy
+        run: |
+          zip="$RUNNER_TEMP/alloy-linux-amd64.zip"
+          curl -fsSLo "$zip" \
+            "https://github.com/grafana/alloy/releases/download/v${ALLOY_VERSION}/alloy-linux-amd64.zip"
+          echo "${ALLOY_SHA256}  $zip" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/alloy"
+          unzip -q "$zip" -d "$RUNNER_TEMP/alloy"
+          chmod +x "$RUNNER_TEMP/alloy/alloy-linux-amd64"
+          echo "ALLOY=$RUNNER_TEMP/alloy/alloy-linux-amd64" >> "$GITHUB_ENV"
+      - run: uv run --frozen pytest -q

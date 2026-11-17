@@ -1,0 +1,13 @@
+# Synthetic engine output for tests/test_push.py: two gauges named as SGLang
+# names them (a colon after the prefix), and one whose `pool` label clashes
+# with the node identity label of the same name.
+# HELP sglang:num_running_reqs The number of running requests.
+# TYPE sglang:num_running_reqs gauge
+sglang:num_running_reqs{model_name="test-model"} 2.0
+# HELP sglang:num_queue_reqs The number of requests in the waiting queue.
+# TYPE sglang:num_queue_reqs gauge
+sglang:num_queue_reqs{model_name="test-model"} 0.0
+# HELP sglang:test_pool_usage A series with a pool label of its own.
+# TYPE sglang:test_pool_usage gauge
+sglang:test_pool_usage{model_name="test-model",pool="kv"} 0.25
+sglang:test_pool_usage{model_name="test-model",pool="swa"} 0.5

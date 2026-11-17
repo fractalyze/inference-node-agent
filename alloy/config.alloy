@@ -1,0 +1,168 @@
+// Metrics collector for one GPU node: scrapes the inference engine (SGLang),
+// the GPU exporter and the host exporter on this node, labels every series
+// with the node's identity, and pushes them to Fractalyze's metrics endpoint
+// by Prometheus remote-write. Metrics only: no logs, no request content.
+//
+// Environment (compose.yml, from node.env): NODE_NAME, CLOUD, REGION, POOL,
+// ROLE, METRICS_PUSH_URL, PUSH_PASSWORD, and TARGETS_DIR, the directory
+// holding engine.json, accel.json and node.json (Prometheus file_sd format).
+//
+// The receiving side selects series by job name (engine, accel, node, alloy)
+// and assumes these scrape intervals, so both are set explicitly: Alloy would
+// otherwise name a job "prometheus.scrape.<label>" and scrape every 60s.
+
+// The engine's /metrics endpoints, one target per SGLang server.
+discovery.file "engine" {
+	files = [sys.env("TARGETS_DIR") + "/engine.json"]
+}
+
+prometheus.scrape "engine" {
+	job_name        = "engine"
+	targets         = discovery.file.engine.targets
+	scrape_interval = "15s"
+	// Text 0.0.4 only: asked for OpenMetrics with escaping=underscores
+	// (Alloy's default), the engine's Python prometheus_client renames
+	// sglang:num_running_reqs to sglang_num_running_reqs, and every sglang:*
+	// series arrives under a name the receiving side does not read.
+	scrape_protocols = ["PrometheusText0.0.4"]
+	forward_to       = [prometheus.relabel.exported.receiver]
+}
+
+// The GPU exporter: dcgm-exporter, from compose.dcgm.yml or the node's own.
+discovery.file "accel" {
+	files = [sys.env("TARGETS_DIR") + "/accel.json"]
+}
+
+prometheus.scrape "accel" {
+	job_name        = "accel"
+	targets         = discovery.file.accel.targets
+	scrape_interval = "5s"
+	scrape_timeout  = "5s"
+	forward_to      = [prometheus.relabel.exported.receiver]
+}
+
+// node-exporter: host CPU, memory, filesystems, disks, network.
+discovery.file "node" {
+	files = [sys.env("TARGETS_DIR") + "/node.json"]
+}
+
+prometheus.scrape "node" {
+	job_name        = "node"
+	targets         = discovery.file.node.targets
+	scrape_interval = "15s"
+	forward_to      = [prometheus.relabel.exported.receiver]
+}
+
+// Alloy's own metrics. The exporter's targets carry job="integrations/self",
+// which takes precedence over job_name, so the relabel sets job="alloy"
+// before scraping.
+prometheus.exporter.self "alloy" { }
+
+discovery.relabel "alloy" {
+	targets = prometheus.exporter.self.alloy.targets
+
+	rule {
+		target_label = "job"
+		replacement  = "alloy"
+	}
+}
+
+prometheus.scrape "alloy" {
+	job_name        = "alloy"
+	targets         = discovery.relabel.alloy.output
+	scrape_interval = "15s"
+	forward_to      = [prometheus.relabel.exported.receiver]
+}
+
+// A scraped label named like an identity label is renamed exported_<name>,
+// as Prometheus does for a scraped label that clashes with a target label.
+// The identity rules below would otherwise overwrite it: SGLang's HiCache
+// series carry pool="kv" and pool="swa", which would collapse into one
+// labelset, and the receiver rejects the second sample at each timestamp.
+prometheus.relabel "exported" {
+	forward_to = [prometheus.relabel.identity.receiver]
+
+	rule {
+		source_labels = ["cloud"]
+		regex         = "(.+)"
+		target_label  = "exported_cloud"
+	}
+
+	rule {
+		source_labels = ["region"]
+		regex         = "(.+)"
+		target_label  = "exported_region"
+	}
+
+	rule {
+		source_labels = ["pool"]
+		regex         = "(.+)"
+		target_label  = "exported_pool"
+	}
+
+	rule {
+		source_labels = ["role"]
+		regex         = "(.+)"
+		target_label  = "exported_role"
+	}
+
+	rule {
+		source_labels = ["node"]
+		regex         = "(.+)"
+		target_label  = "exported_node"
+	}
+
+	rule {
+		action = "labeldrop"
+		regex  = "cloud|region|pool|role|node"
+	}
+}
+
+// The node's identity, on every series it pushes.
+prometheus.relabel "identity" {
+	forward_to = [prometheus.remote_write.central.receiver]
+
+	rule {
+		target_label = "node"
+		replacement  = sys.env("NODE_NAME")
+	}
+
+	rule {
+		target_label = "cloud"
+		replacement  = sys.env("CLOUD")
+	}
+
+	rule {
+		target_label = "region"
+		replacement  = sys.env("REGION")
+	}
+
+	rule {
+		target_label = "pool"
+		replacement  = sys.env("POOL")
+	}
+
+	rule {
+		target_label = "role"
+		replacement  = sys.env("ROLE")
+	}
+}
+
+// Fractalyze's remote-write endpoint. The basic-auth user is the node's
+// name. The WAL in --storage.path holds samples through an outage of up to
+// 2 h, the window in which the receiver still accepts late samples; samples
+// older than that are lost.
+prometheus.remote_write "central" {
+	endpoint {
+		url = sys.env("METRICS_PUSH_URL")
+
+		basic_auth {
+			username = sys.env("NODE_NAME")
+			password = sys.env("PUSH_PASSWORD")
+		}
+	}
+
+	wal {
+		max_keepalive_time = "2h"
+	}
+}

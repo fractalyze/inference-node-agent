@@ -1,0 +1,99 @@
+# Metrics collectors for one GPU node. Alloy scrapes the node and pushes to
+# Fractalyze's metrics endpoint by Prometheus remote-write (outbound HTTPS);
+# nothing here listens outside the host. From the repo root:
+#
+#   docker compose --env-file node.env -f compose.yml -f compose.dcgm.yml up -d
+#
+# Leave out compose.dcgm.yml on a node that already runs dcgm-exporter, and
+# point targets/accel.json at that one (README "GPU metrics").
+#
+# Images are pinned by digest (repo:tag@sha256:<digest>): Docker pulls by the
+# digest, the tag is there for people. An upgrade is a new commit of this repo.
+#
+# Bind mounts use the long syntax: a missing source fails `up` instead of
+# Docker creating an empty directory in its place.
+
+name: inference-node-agent
+
+# Bounded container logs (json-file rotation): at most 5 x 50 MiB per container.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+services:
+  # Runs alloy/config.alloy: the scrape jobs, the node identity labels and the
+  # push endpoint.
+  alloy:
+    logging: *default-logging
+    image: grafana/alloy:v1.21.2@sha256:89a5a320168387336b9ac3c850609c3ba7757eadd4ae5f1d819deb35e9854b18
+    restart: unless-stopped
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config/config.alloy
+    environment:
+      NODE_NAME: ${NODE_NAME:?set NODE_NAME in node.env}
+      CLOUD: ${CLOUD:?set CLOUD in node.env}
+      REGION: ${REGION:?set REGION in node.env}
+      POOL: ${POOL:?set POOL in node.env}
+      ROLE: ${ROLE:?set ROLE in node.env to unified, prefill or decode}
+      METRICS_PUSH_URL: ${METRICS_PUSH_URL:?set METRICS_PUSH_URL in node.env}
+      PUSH_PASSWORD: ${PUSH_PASSWORD:?set PUSH_PASSWORD in node.env}
+      TARGETS_DIR: /etc/alloy/targets
+    # An engine listening on the host is reachable as host.docker.internal
+    # (targets/engine.json).
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    volumes:
+      # The directory, not the file: `git pull` writes a changed file as a
+      # new inode, which a single-file bind never shows.
+      - type: bind
+        source: ./alloy
+        target: /etc/alloy/config
+        read_only: true
+      # Scrape targets (Prometheus file_sd format). engine.json and accel.json
+      # are this node's own, copied from the .example files; Alloy reads them
+      # at start, so an edit needs `up -d --force-recreate alloy`.
+      - type: bind
+        source: ./targets/engine.json
+        target: /etc/alloy/targets/engine.json
+        read_only: true
+      - type: bind
+        source: ./targets/accel.json
+        target: /etc/alloy/targets/accel.json
+        read_only: true
+      - type: bind
+        source: ./targets/node.json
+        target: /etc/alloy/targets/node.json
+        read_only: true
+      # Remote-write WAL: rides out push endpoint outages of up to 2 h.
+      - type: volume
+        source: alloy-data
+        target: /var/lib/alloy/data
+    # Alloy's UI and own metrics, on the host's loopback only (README "Verify").
+    ports:
+      - "127.0.0.1:${ALLOY_UI_PORT:-12345}:12345"
+
+  # Host metrics: CPU, memory, filesystems, disks, network.
+  node-exporter:
+    logging: *default-logging
+    image: prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0
+    restart: unless-stopped
+    command:
+      - --path.rootfs=/host
+    pid: host
+    volumes:
+      - type: bind
+        source: /
+        target: /host
+        read_only: true
+        bind:
+          propagation: rslave
+    expose:
+      - "9100"
+
+volumes:
+  alloy-data:

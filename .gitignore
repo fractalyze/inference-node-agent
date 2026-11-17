@@ -1,0 +1,8 @@
+# Per-node values, created from the examples next to them.
+node.env
+targets/engine.json
+targets/accel.json
+
+.venv/
+__pycache__/
+.pytest_cache/

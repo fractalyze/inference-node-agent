@@ -1,0 +1,40 @@
+# NVIDIA GPU metrics: dcgm-exporter, scraped by Alloy as accel-exporter:9400
+# (targets/accel.json.example). Add to compose.yml with -f. Needs the NVIDIA
+# Container Toolkit. Leave this file out on a node that already runs
+# dcgm-exporter (README "GPU metrics").
+
+# Bounded container logs (json-file rotation): at most 5 x 50 MiB per container.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+services:
+  accel-exporter:
+    logging: *default-logging
+    image: nvcr.io/nvidia/k8s/dcgm-exporter:4.6.1-4.8.4-distroless@sha256:148b0c025e5f2850256816fa33754fbf4733b7a086697a95613fc0ba3db5b003
+    restart: unless-stopped
+    # The counter list is mounted beside /etc/dcgm-exporter, not over it: that
+    # directory holds the exporter's own CSVs. -c: collect every 5000 ms (the
+    # accel scrape interval is 5 s; the exporter's default is 30 s).
+    command: ["-f", "/etc/fractalyze/dcgm/dcgm-counters.csv", "-c", "5000"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Required for the DCGM_FI_PROF_* fields (NVLink and PCIe throughput); the
+    # image runs as root. Without it those four series are empty and every
+    # other one is unaffected.
+    cap_add:
+      - SYS_ADMIN
+    volumes:
+      - type: bind
+        source: ./dcgm
+        target: /etc/fractalyze/dcgm
+        read_only: true
+    expose:
+      - "9400"
