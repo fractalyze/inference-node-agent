@@ -8,6 +8,41 @@ Prometheus remote-write.
 This repo ships configuration, not software: the compose files run upstream
 images (Alloy, node-exporter, dcgm-exporter), pinned by digest.
 
+- [How it works](#how-it-works)
+- [What leaves the node](#what-leaves-the-node)
+- [Before you start](#before-you-start)
+- [Deploy](#deploy)
+- [Operate](#operate)
+- [Configuration reference](#configuration-reference)
+- [Troubleshooting](#troubleshooting)
+- [Upgrade](#upgrade)
+- [Remove](#remove)
+- [Repository layout](#repository-layout)
+- [Maintaining](#maintaining)
+- [Tests](#tests)
+
+## How it works
+
+```
+ GPU node (yours)                                         Fractalyze
+┌──────────────────────────────────────────────┐
+│  SGLang  /metrics ──────────┐                │
+│  (your engine)              │ 15 s           │
+│                             ▼                │
+│  dcgm-exporter ──5 s──▶  ┌───────┐  HTTPS    │        ┌──────────────┐
+│  (bundled or yours)      │ Alloy │ ──────────┼──────▶ │ metrics      │
+│                          └───────┘ remote-   │        │ endpoint     │
+│  node-exporter ──15 s──▶    ▲      write     │        └──────────────┘
+│  (bundled)                  │                │
+│                     node.env, targets/*.json │
+└──────────────────────────────────────────────┘
+```
+
+Alloy pulls metrics from three sources on the node, adds the node's identity
+labels, and pushes them out. The connection is always opened from the node:
+Fractalyze never connects in. Dashboards and alerting run on Fractalyze's
+side; nothing on the node depends on the endpoint being reachable.
+
 ## What leaves the node
 
 Metrics only, as numeric time series, over one outbound HTTPS connection:
@@ -26,116 +61,333 @@ Not collected: logs, prompts, completions, or any other request content. The
 collectors do not mount the Docker socket and accept no inbound connection:
 the only published port is Alloy's UI on the host's loopback.
 
-## Requirements
+What the containers can see on the host:
 
-- Docker with Compose v2.
+| Container | Access |
+|---|---|
+| `alloy` | This repo's `alloy/` and `targets/` (read-only), its own data volume, the network |
+| `node-exporter` | The host's root filesystem read-only and the host PID namespace, to read `/proc` and `/sys` |
+| `accel-exporter` | Every GPU through the NVIDIA runtime, with the `SYS_ADMIN` capability (see [GPU exporter](#3-choose-the-gpu-exporter)) |
+
+## Before you start
+
+From Fractalyze, per node:
+
+| Value | Example | Goes in |
+|---|---|---|
+| Node name | `acme-h100-01` | `NODE_NAME` |
+| Provider name | `acme` | `CLOUD` |
+| Region | `us-east-1` | `REGION` |
+| Pool | `qwen3-8b` | `POOL` |
+| Role | `unified` | `ROLE` |
+| Push URL | `https://obs.example.com/api/v1/write` | `METRICS_PUSH_URL` |
+| Push password | one per node | `PUSH_PASSWORD` |
+
+On the node:
+
+- Docker Engine 20.10 or later with the Compose v2 plugin (`docker compose
+  version`).
 - NVIDIA GPUs with the NVIDIA Container Toolkit, for the bundled
-  dcgm-exporter (not needed if the node already runs one, see
-  [GPU metrics](#gpu-metrics)).
-- Outbound HTTPS to the push endpoint Fractalyze provides.
-- SGLang started with `--enable-metrics`, on an address the Alloy container
-  can reach (see [Engine](#engine)).
+  dcgm-exporter. Not needed if the node already runs dcgm-exporter.
+- Outbound HTTPS (TCP 443) to the push URL's host.
+- SGLang started with `--enable-metrics`.
 
-## Setup
+To send to Fractalyze: the SGLang version the node runs. Fractalyze's
+dashboards are built on SGLang's metric names, which change between versions.
 
-Fractalyze provides the values for `node.env`: the node's identity labels,
-the push URL, and one push password per node.
+## Deploy
+
+Repeat on every node. Each node has its own `NODE_NAME` and push password.
+
+### 1. Get the repo
 
 ```sh
 git clone https://github.com/fractalyze/inference-node-agent.git
 cd inference-node-agent
-
-cp node.env.example node.env                         # fill in
-cp targets/engine.json.example targets/engine.json   # the engine's address
-cp targets/accel.json.example targets/accel.json     # the GPU exporter's address
-
-docker compose --env-file node.env -f compose.yml -f compose.dcgm.yml up -d
 ```
 
-The three copied files are git-ignored, so `git pull` never touches them.
-Compose names any value `node.env` leaves empty and refuses to start.
+Every command below runs from this directory.
 
-### Engine
+### 2. Fill in `node.env`
 
-`targets/engine.json` lists the `host:port` of every SGLang server on the
-node, in Prometheus
+```sh
+cp node.env.example node.env
+chmod 600 node.env   # it holds the push password
+```
+
+Set every key to the value Fractalyze provided
+([reference](#nodeenv)). Put the password in single quotes:
+`PUSH_PASSWORD='ab$cd9'`. Compose expands `$` in unquoted values.
+
+### 3. Choose the GPU exporter
+
+**The node runs no dcgm-exporter (default).** Use the bundled one:
+
+```sh
+cp targets/accel.json.example targets/accel.json
+```
+
+and keep `-f compose.dcgm.yml` in the `agent` function of step 5. The
+bundled exporter collects the fields in
+[`dcgm/dcgm-counters.csv`](dcgm/dcgm-counters.csv) every 5 s. It runs with
+the `SYS_ADMIN` capability, which the four `DCGM_FI_PROF_*` fields (NVLink
+and PCIe throughput) need; removing `cap_add` from `compose.dcgm.yml` leaves
+those four series empty and affects nothing else.
+
+**The node already runs dcgm-exporter.** Use that one: write its address to
+`targets/accel.json` and drop `-f compose.dcgm.yml` in step 5.
+
+```sh
+echo '[{"targets": ["host.docker.internal:9400"]}]' > targets/accel.json
+```
+
+That exporter must export the fields in `dcgm/dcgm-counters.csv` with
+dcgm-exporter's default `gpu` and `modelName` labels. Extra fields and labels
+are harmless. A collection interval longer than 5 s works, with coarser GPU
+graphs.
+
+### 4. Point Alloy at the engine
+
+Start SGLang with `--enable-metrics`; it then serves `/metrics` on its API
+port. Check from the host (30000 is SGLang's default port):
+
+```sh
+curl -s http://127.0.0.1:30000/metrics | grep -c '^sglang:'
+```
+
+A count above 0 means metrics are on. Then list every SGLang server of the
+node in `targets/engine.json`, in Prometheus
 [file_sd](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#file_sd_config)
-format. SGLang serves `/metrics` on its API port when started with
-`--enable-metrics`.
+format:
+
+```sh
+cp targets/engine.json.example targets/engine.json
+```
 
 ```json
 [{"targets": ["host.docker.internal:30000", "host.docker.internal:30001"]}]
 ```
 
-`host.docker.internal` is the host as seen from the Alloy container, so it
-reaches an engine that listens on the host (a process, or a container with a
-published port). The engine must listen on an address the Docker bridge can
-reach: `0.0.0.0` or the bridge gateway, not `127.0.0.1` only. An engine
-container can instead join the `inference-node-agent_default` network and be
-listed by its container name.
+Which address to write depends on how the engine runs:
+
+| Engine runs as | Address | Requirement |
+|---|---|---|
+| A process on the host | `host.docker.internal:<port>` | SGLang started with `--host 0.0.0.0` (or the Docker bridge gateway address), not `127.0.0.1` |
+| A container with a published port | `host.docker.internal:<published port>` | The port is published on `0.0.0.0` or the bridge gateway, not `127.0.0.1` only |
+| A container, no published port | `<container name>:<port>` | The container joins the network `inference-node-agent_default`, which exists after the first `up` |
+
+`host.docker.internal` is the host as seen from the Alloy container.
 
 Optional: `--enable-mfu-metrics` adds SGLang's estimated FLOP and memory
 traffic counters.
 
-### GPU metrics
+### 5. Start
 
-`compose.dcgm.yml` runs dcgm-exporter with the field list in
-[`dcgm/dcgm-counters.csv`](dcgm/dcgm-counters.csv), collecting every 5 s. It
-adds the `SYS_ADMIN` capability, which the four `DCGM_FI_PROF_*` fields
-(NVLink and PCIe throughput) need; removing it leaves those four series
-empty and affects nothing else.
-
-A node that already runs dcgm-exporter can use that one instead: leave
-`compose.dcgm.yml` out of every command and put the existing exporter's
-address in `targets/accel.json`, for example
-`[{"targets": ["host.docker.internal:9400"]}]`. That exporter must export
-the fields in `dcgm/dcgm-counters.csv` with dcgm-exporter's default `gpu`
-and `modelName` labels. Extra fields and labels are harmless.
-
-## Verify
+Define a shorthand for the compose command (bash or zsh; add it to your shell
+profile to keep it). Leave out `-f compose.dcgm.yml` if the node uses its own
+dcgm-exporter:
 
 ```sh
-docker compose --env-file node.env -f compose.yml -f compose.dcgm.yml ps
+agent() { docker compose --env-file node.env -f compose.yml -f compose.dcgm.yml "$@"; }
+```
+
+```sh
+agent config -q   # checks node.env: names any missing value
+agent pull
+agent up -d
+```
+
+The containers restart on their own after a crash, and after a reboot if
+Docker starts at boot.
+
+### 6. Verify
+
+```sh
+agent ps
+```
+
+`alloy`, `node-exporter` and (if bundled) `accel-exporter` are `running`.
+
+```sh
 curl -s http://127.0.0.1:12345/metrics | grep -E '^prometheus_remote_storage_samples_(total|failed_total)'
 ```
 
 `samples_total` grows within a minute of start, and `samples_failed_total`
-stays at 0. A growing failure count means the endpoint rejected the push
-(`docker compose ... logs alloy` shows the HTTP status: 401 is a wrong
-`NODE_NAME` or `PUSH_PASSWORD`).
+stays at 0.
 
-Alloy's UI at <http://127.0.0.1:12345> shows each scrape job and its targets;
-a target that is down points at a wrong address in `targets/`. Set
-`ALLOY_UI_PORT` in `node.env` if port 12345 is taken.
-
-Alloy reads `targets/*.json` and `node.env` at start. After editing one:
+Then open Alloy's UI, which lists each scrape job with the health of its
+targets. It listens on the node's loopback only, so from a workstation:
 
 ```sh
-docker compose --env-file node.env -f compose.yml -f compose.dcgm.yml up -d --force-recreate alloy
+ssh -L 12345:127.0.0.1:12345 <node>
+# then open http://127.0.0.1:12345
 ```
 
-## Outages
+`prometheus.scrape.engine`, `prometheus.scrape.accel` and
+`prometheus.scrape.node` each show their targets as up. Finally, tell
+Fractalyze the node is up: they confirm the series arrive with the right
+labels.
 
-Alloy keeps samples on disk (the `alloy-data` volume) while the push
-endpoint is unreachable and sends them once it returns, for outages of up to
-2 hours. Older samples are dropped. Nothing on the node depends on the
-endpoint: an outage never affects the engine.
+## Operate
+
+| Task | Command |
+|---|---|
+| Status | `agent ps` |
+| Alloy's log | `agent logs --tail 100 alloy` |
+| Follow all logs | `agent logs -f` |
+| Stop (keeps buffered samples) | `agent stop` |
+| Start again | `agent up -d` |
+| Restart Alloy | `agent restart alloy` |
+
+**After changing `node.env` or a file in `targets/`.** Alloy reads them at
+start, so recreate it:
+
+```sh
+agent up -d --force-recreate alloy
+```
+
+**When the engine's address or port changes, or an engine is added.** Edit
+`targets/engine.json` and recreate Alloy as above. Restarting the engine on
+the same address needs nothing: Alloy keeps scraping and picks it up when it
+returns.
+
+**When the push password is rotated.** Fractalyze sends the new one; set
+`PUSH_PASSWORD` in `node.env` and recreate Alloy.
+
+**When the push endpoint is unreachable.** Alloy keeps samples on disk (the
+`alloy-data` volume) and sends them once the endpoint returns, for outages of
+up to 2 hours. Older samples are dropped. An outage never affects the
+engine.
+
+**Disk use.** Container logs are capped at 250 MiB per container.
+
+## Configuration reference
+
+### `node.env`
+
+| Key | Required | Meaning |
+|---|---|---|
+| `NODE_NAME` | yes | Unique name of the node. Label `node` on every series, and the basic-auth user at the push endpoint |
+| `CLOUD` | yes | Name of the provider operating the node. Label `cloud` |
+| `REGION` | yes | Region or site. Label `region` |
+| `POOL` | yes | The model pool the node serves. Label `pool` |
+| `ROLE` | yes | The node's role in its pool: `unified`, `prefill` or `decode`. Label `role` |
+| `METRICS_PUSH_URL` | yes | Prometheus remote-write URL |
+| `PUSH_PASSWORD` | yes | The node's push password, single-quoted |
+| `ALLOY_UI_PORT` | no | Loopback port of Alloy's UI. Default `12345` |
+
+Use the values exactly as Fractalyze provided them: dashboards and alerts
+select by these labels.
+
+### `targets/`
+
+Scrape targets in Prometheus file_sd format: a JSON list of
+`{"targets": ["host:port", ...]}` groups.
+
+| File | Job | Created by |
+|---|---|---|
+| `targets/engine.json` | `engine` | You, from `engine.json.example` |
+| `targets/accel.json` | `accel` | You, from `accel.json.example` |
+| `targets/node.json` | `node` | In the repo (the bundled node-exporter) |
+
+`node.env`, `targets/engine.json` and `targets/accel.json` are git-ignored,
+so `git pull` never touches them.
+
+### Ports
+
+| Port | Where | Purpose |
+|---|---|---|
+| `127.0.0.1:12345` | Host loopback | Alloy's UI and own metrics |
+| 9100, 9400, 12345 | Compose network only | node-exporter, dcgm-exporter, Alloy |
+
+Nothing listens on a public interface, and the bundled exporters do not
+clash with a node-exporter or dcgm-exporter already running on the host.
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `agent config` or `up` prints `set NODE_NAME in node.env` (or another key) | The key is empty or missing | Fill it in `node.env` |
+| `up` fails with `bind source path does not exist: .../targets/engine.json` | The target file was not created | Step 3 or 4 |
+| `samples_failed_total` grows; Alloy's log shows `401` | Wrong `NODE_NAME` or `PUSH_PASSWORD`, or `$` in an unquoted password | Fix `node.env` (single quotes), recreate Alloy |
+| Alloy's log shows a timeout or `no such host` for the push URL | Outbound HTTPS is blocked, or `METRICS_PUSH_URL` is wrong | Allow TCP 443 to the endpoint's host; check the URL |
+| Engine target is down: `connection refused` | The engine listens on `127.0.0.1` only, or the port is wrong | See the address table in step 4 |
+| Engine target is down: timeout | A host firewall drops traffic from the Docker bridge to the engine's port | Allow the bridge subnet to reach that port |
+| Engine target is down with HTTP 404, or the `curl` of step 4 counts 0 | SGLang runs without `--enable-metrics` | Restart the engine with the flag |
+| `accel-exporter` does not start: `could not select device driver "nvidia"` | The NVIDIA Container Toolkit is missing or not configured for Docker | Install it, or use the node's own dcgm-exporter |
+| Port 12345 is already in use | Another service on the host | Set `ALLOY_UI_PORT` in `node.env` |
+
+When asking Fractalyze for help, attach `agent ps` and
+`agent logs --tail 200 alloy`. Neither contains the push password.
 
 ## Upgrade
 
+Fractalyze announces a new version as a commit or tag of this repo. Image
+versions are part of the compose files, so a commit is the whole version.
+
 ```sh
-git pull
-docker compose --env-file node.env -f compose.yml -f compose.dcgm.yml up -d
+git pull          # or: git fetch && git checkout <tag or commit>
+agent pull
+agent up -d
 ```
 
-Image versions are part of the compose files, so a commit of this repo is the
-whole version.
+Buffered samples survive the upgrade.
 
 ## Remove
 
 ```sh
-docker compose --env-file node.env -f compose.yml -f compose.dcgm.yml down -v
+agent down -v     # -v also deletes the buffered samples
+cd .. && rm -rf inference-node-agent
 ```
+
+Tell Fractalyze, so the node's push password is revoked.
+
+## Repository layout
+
+```
+alloy/config.alloy       scrape jobs, identity labels, remote-write
+compose.yml              Alloy and node-exporter
+compose.dcgm.yml         dcgm-exporter (optional overlay)
+dcgm/dcgm-counters.csv   DCGM fields the bundled exporter collects
+node.env.example         per-node values, copied to node.env
+targets/                 scrape targets, and the examples to copy
+tests/                   pytest
+```
+
+## Maintaining
+
+For Fractalyze. The receiving side (recording rules and dashboards) reads
+what this repo sends by name, so these are a contract, not style:
+
+| What | Value | Where |
+|---|---|---|
+| Job names | `engine`, `accel`, `node`, `alloy` | `alloy/config.alloy` |
+| Scrape intervals | 15 s, `accel` 5 s | `alloy/config.alloy` |
+| Engine scrape format | Prometheus text 0.0.4, so `sglang:*` names keep their colon | `alloy/config.alloy` |
+| Identity labels | `node`, `cloud`, `region`, `pool`, `role`; a scraped label of the same name becomes `exported_<name>` | `alloy/config.alloy` |
+| Basic-auth user | The node's `NODE_NAME` | `alloy/config.alloy` |
+| DCGM fields | The list the GPU rules read | `dcgm/dcgm-counters.csv` |
+
+`alloy/config.alloy` and `dcgm/dcgm-counters.csv` mirror Fractalyze's
+internal collector configuration. Nothing compares the two automatically:
+change them together, in both places. The tests here pin the job names,
+intervals, labels and auth user, so an accidental change fails CI.
+
+Onboarding a provider's node:
+
+1. Agree on the node's `NODE_NAME`, `CLOUD`, `REGION`, `POOL` and `ROLE`.
+2. Create a push password and register the node as a push user at the
+   metrics endpoint.
+3. Send the provider those values and the push URL, over a private channel.
+4. Get the node's SGLang version and check its `/metrics` output against
+   the engine rules.
+5. After the provider reports the node up, confirm its series arrive with
+   the right labels.
+
+A release is a commit on `main`: upstream image versions are pinned by
+digest in the compose files, and the Alloy version CI tests with is the one
+`compose.yml` runs. Announce the commit or a tag to providers
+([Upgrade](#upgrade)).
 
 ## Tests
 
