@@ -18,6 +18,7 @@ images (Alloy, node-exporter, dcgm-exporter), pinned by digest.
 - [Upgrade](#upgrade)
 - [Remove](#remove)
 - [Repository layout](#repository-layout)
+- [Maintaining](#maintaining)
 - [Tests](#tests)
 
 ## How it works
@@ -352,6 +353,41 @@ node.env.example         per-node values, copied to node.env
 targets/                 scrape targets, and the examples to copy
 tests/                   pytest
 ```
+
+## Maintaining
+
+For Fractalyze. The receiving side (recording rules and dashboards) reads
+what this repo sends by name, so these are a contract, not style:
+
+| What | Value | Where |
+|---|---|---|
+| Job names | `engine`, `accel`, `node`, `alloy` | `alloy/config.alloy` |
+| Scrape intervals | 15 s, `accel` 5 s | `alloy/config.alloy` |
+| Engine scrape format | Prometheus text 0.0.4, so `sglang:*` names keep their colon | `alloy/config.alloy` |
+| Identity labels | `node`, `cloud`, `region`, `pool`, `role`; a scraped label of the same name becomes `exported_<name>` | `alloy/config.alloy` |
+| Basic-auth user | The node's `NODE_NAME` | `alloy/config.alloy` |
+| DCGM fields | The list the GPU rules read | `dcgm/dcgm-counters.csv` |
+
+`alloy/config.alloy` and `dcgm/dcgm-counters.csv` mirror Fractalyze's
+internal collector configuration. Nothing compares the two automatically:
+change them together, in both places. The tests here pin the job names,
+intervals, labels and auth user, so an accidental change fails CI.
+
+Onboarding a provider's node:
+
+1. Agree on the node's `NODE_NAME`, `CLOUD`, `REGION`, `POOL` and `ROLE`.
+2. Create a push password and register the node as a push user at the
+   metrics endpoint.
+3. Send the provider those values and the push URL, over a private channel.
+4. Get the node's SGLang version and check its `/metrics` output against
+   the engine rules.
+5. After the provider reports the node up, confirm its series arrive with
+   the right labels.
+
+A release is a commit on `main`: upstream image versions are pinned by
+digest in the compose files, and the Alloy version CI tests with is the one
+`compose.yml` runs. Announce the commit or a tag to providers
+([Upgrade](#upgrade)).
 
 ## Tests
 
